@@ -14,6 +14,8 @@
 #include "access/htup_details.h"
 #endif
 
+#include <curl/curl.h>
+
 PG_MODULE_MAGIC;
 
 #ifndef PG_MAJORVERSION_NUM
@@ -184,41 +186,80 @@ pg_logger_get_internal(void)
 	PG_RETURN_DATUM(HeapTupleGetDatum(htup));
 }
 
+static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata)
+{
+    /*
+    size_t written = fwrite(ptr, size, nmemb, static_cast<FILE*>(userdata));
+    return written;
+    */
+    return size*nmemb;
+}
+
+
 void
 pg_logger_emit_log_internal(ErrorData *edata)
 {
-	/* Not interested in noncrit messages */
-	if (edata->elevel < ERROR)
-		return;
-
-	if (IsAutoVacuumWorkerProcess())
-		return;
+	CURL *curl;
+	CURLcode res;
+	char data[1024];
 
 	/* should not be possible, but better safe than sorry */
-	if (!shmem)
-		return;
+//	if (!shmem)
+//		return;
 
 	/* avoid recursion */
 	if (in_error_recursion_trouble())
 		return;
 
-	/* increment counters */
-	switch (edata->sqlerrcode)
+	/* get a curl handle */
+	curl = curl_easy_init();
+	if (curl)
 	{
-		case ERRCODE_QUERY_CANCELED:
-			if (strstr(edata->message_id, "statement timeout"))
-				pg_atomic_add_fetch_u64(&shmem->count.statement_timeout, 1);
-			else if (strstr(edata->message_id, "user request"))
-				pg_atomic_add_fetch_u64(&shmem->count.statement_cancel, 1);
-			break;
-		case ERRCODE_LOCK_NOT_AVAILABLE:
-			pg_atomic_add_fetch_u64(&shmem->count.lock_timeout, 1);
-			break;
-		case ERRCODE_IDLE_IN_TRANSACTION_SESSION_TIMEOUT:
-			pg_atomic_add_fetch_u64(&shmem->count.idle_in_tx_timeout, 1);
-			break;
+		/*
+		 * First set the URL that is about to receive our POST. This URL can
+		 * just as well be an https:// URL if that is what should receive the
+		 * data.
+		 */
+		snprintf(
+			data,
+			1024,
+			"{\"index\":\"seq-db\"}\n{\"service\":\"testing-t\",\"accessAudit\":\"true\",\"message\":\"%s\"}\n",
+			edata->message);
+
+		curl_easy_setopt(curl, CURLOPT_URL, "http://interlog.logging.stg.s.o3.ru/_bulk");
+		/* Now specify the POST data */
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
+
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, NULL);
+
+		/* Perform the request, res will get the return code */
+		res = curl_easy_perform(curl);
+		/* Check for errors */
+		if(res != CURLE_OK)
+			elog(ERROR, "curl_easy_perform() failed: %s", curl_easy_strerror(res));
+
+		/* always cleanup */
+		curl_easy_cleanup(curl);
 	}
-	/* elog(WARNING, "SQL CODE: %s", unpack_sql_state(edata->sqlerrcode)); */
+
+	/* increment counters */
+//	switch (edata->sqlerrcode)
+//	{
+//		case ERRCODE_QUERY_CANCELED:
+//			if (strstr(edata->message_id, "statement timeout"))
+//				pg_atomic_add_fetch_u64(&shmem->count.statement_timeout, 1);
+//			else if (strstr(edata->message_id, "user request"))
+//				pg_atomic_add_fetch_u64(&shmem->count.statement_cancel, 1);
+//			break;
+//		case ERRCODE_LOCK_NOT_AVAILABLE:
+//			pg_atomic_add_fetch_u64(&shmem->count.lock_timeout, 1);
+//			break;
+//		case ERRCODE_IDLE_IN_TRANSACTION_SESSION_TIMEOUT:
+//			pg_atomic_add_fetch_u64(&shmem->count.idle_in_tx_timeout, 1);
+//			break;
+//	}
+//	/* elog(WARNING, "SQL CODE: %s", unpack_sql_state(edata->sqlerrcode)); */
 }
 
 void
@@ -259,7 +300,7 @@ pg_logger_shmem_startup_internal(void)
 	/*
 	 * Attempt to load old statistics
 	 */
-	f = AllocateFile(pg_logger_DUMP_FILE, PG_BINARY_R);
+	f = AllocateFile(PG_LOGGER_DUMP_FILE, PG_BINARY_R);
 	if (f == NULL)
 	{
 		if (errno == ENOENT)
@@ -268,7 +309,7 @@ pg_logger_shmem_startup_internal(void)
 		/* failed to open file due to some external reason */
 		ereport(WARNING,
 				(errcode_for_file_access(),
-				 errmsg("could not allocate file \"%s\": %m", pg_logger_DUMP_FILE)));
+				 errmsg("could not allocate file \"%s\": %m", PG_LOGGER_DUMP_FILE)));
 		goto err;
 	}
 
@@ -277,7 +318,7 @@ pg_logger_shmem_startup_internal(void)
 	{
 		ereport(WARNING,
 				(errcode_for_file_access(),
-				 errmsg("could not read file \"%s\": %m", pg_logger_DUMP_FILE)));
+				 errmsg("could not read file \"%s\": %m", PG_LOGGER_DUMP_FILE)));
 		goto err;
 	}
 
@@ -286,7 +327,7 @@ pg_logger_shmem_startup_internal(void)
 	/* LWLockRelease(shmem->lock); */
 
 	/* validate header */
-	if (hdr.magic != pg_logger_HEADER_MAGIC || hdr.pg_version_num != PG_MAJORVERSION_NUM)
+	if (hdr.magic != PG_LOGGER_HEADER_MAGIC || hdr.pg_version_num != PG_MAJORVERSION_NUM)
 		goto err;
 
 	pg_atomic_add_fetch_u64(&shmem->count.statement_cancel, temp.statement_cancel.value);
@@ -298,8 +339,8 @@ err:
 	if (f && FreeFile(f))
 		ereport(WARNING,
 				(errcode_for_file_access(),
-				 errmsg("could not close file \"%s\": %m", pg_logger_DUMP_FILE)));
-	unlink(pg_logger_DUMP_FILE);
+				 errmsg("could not close file \"%s\": %m", PG_LOGGER_DUMP_FILE)));
+	unlink(PG_LOGGER_DUMP_FILE);
 }
 
 /*
@@ -311,7 +352,7 @@ pg_logger_shmem_shutdown(int code, Datum arg)
 	FILE	   *f = NULL;
 	pg_logger_header hdr;
 
-	hdr.magic = pg_logger_HEADER_MAGIC;
+	hdr.magic = PG_LOGGER_HEADER_MAGIC;
 	hdr.pg_version_num = PG_MAJORVERSION_NUM;
 
 	/* Don't try to dump during a crash. */
@@ -322,20 +363,20 @@ pg_logger_shmem_shutdown(int code, Datum arg)
 	 * Open temp file, dump stats, fsync and rename into place, so we
 	 * atomically replace any old one.
 	 */
-	f = AllocateFile(pg_logger_DUMP_FILE ".tmp", PG_BINARY_W);
+	f = AllocateFile(PG_LOGGER_DUMP_FILE ".tmp", PG_BINARY_W);
 	if (f == NULL)
 		ereport(WARNING,
 				(errcode_for_file_access(),
 				 errmsg("could not open for writing file \"%s\": %m",
-						pg_logger_DUMP_FILE ".tmp")));
+						PG_LOGGER_DUMP_FILE ".tmp")));
 
 	else if ((fwrite(&hdr, sizeof(pg_logger_header), 1, f) == 1) &&
 			 fwrite(&(shmem->count), sizeof(pg_logger_counter), 1, f) == 1)
-		durable_rename(pg_logger_DUMP_FILE ".tmp", pg_logger_DUMP_FILE, WARNING);
+		durable_rename(PG_LOGGER_DUMP_FILE ".tmp", PG_LOGGER_DUMP_FILE, WARNING);
 
 	if (f && FreeFile(f))
 		ereport(WARNING,
 				(errcode_for_file_access(),
 				 errmsg("could not write file \"%s\": %m",
-						pg_logger_DUMP_FILE ".tmp")));
+						PG_LOGGER_DUMP_FILE ".tmp")));
 }
